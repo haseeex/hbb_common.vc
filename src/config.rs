@@ -531,13 +531,19 @@ impl Config2 {
 
     fn store(&self) {
         let mut config = self.clone();
+        let stored = Config::load_::<Config2>("2");
         if let Some(mut socks) = config.socks {
+            let stored_password = stored
+                .socks
+                .as_ref()
+                .map(|socks| socks.password.as_str())
+                .unwrap_or_default();
             socks.password =
-                encrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                keep_encrypted_storage_if_plaintext_unchanged(&socks.password, stored_password);
             config.socks = Some(socks);
         }
         config.unlock_pin =
-            encrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+            keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
         Config::store_(&config, "2");
     }
 
@@ -554,6 +560,14 @@ impl Config2 {
         lock.store();
         true
     }
+}
+
+fn keep_encrypted_storage_if_plaintext_unchanged(plain: &str, stored: &str) -> String {
+    let (stored_plain, encrypted, _) = decrypt_str_or_original(stored, PASSWORD_ENC_VERSION);
+    if encrypted && stored_plain == plain {
+        return stored.to_owned();
+    }
+    encrypt_str_or_original(plain, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
 }
 
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
@@ -722,10 +736,16 @@ impl Config {
         if !config.password.is_empty()
             && decode_permanent_password_h1_from_storage(&config.password).is_none()
         {
+            let stored = Config::load_::<Config>("");
             config.password =
-                encrypt_str_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+                keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
         }
-        config.enc_id = encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let (stored_id, encrypted, _) =
+            decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
+        if !encrypted || stored_id != config.id {
+            config.enc_id =
+                encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        }
         config.id = "".to_owned();
         Config::store_(&config, "");
     }
@@ -2979,6 +2999,8 @@ pub mod keys {
     pub const OPTION_HIDE_REMOTE_PRINTER_SETTINGS: &str = "hide-remote-printer-settings";
     pub const OPTION_HIDE_WEBSOCKET_SETTINGS: &str = "hide-websocket-settings";
     pub const OPTION_HIDE_STOP_SERVICE: &str = "hide-stop-service";
+    pub const OPTION_ALLOW_COMMAND_LINE_SETTINGS_WHEN_SETTINGS_DISABLED: &str =
+        "allow-command-line-settings-when-settings-disabled";
 
     // Connection punch-through options
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
@@ -3213,6 +3235,7 @@ pub mod keys {
         OPTION_DISABLE_UNLOCK_PIN,
         OPTION_USE_RAW_TCP_FOR_API,
         OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW,
+        OPTION_ALLOW_COMMAND_LINE_SETTINGS_WHEN_SETTINGS_DISABLED,
     ];
 }
 
@@ -3275,6 +3298,11 @@ mod tests {
         original_hard_settings: HashMap<String, String>,
     }
 
+    struct ConfigFileRestoreGuard {
+        path: PathBuf,
+        original_content: Option<Vec<u8>>,
+    }
+
     impl ConfigStateTestGuard {
         fn new(config: Config, hard_settings: HashMap<String, String>) -> Self {
             let original_config = Config::get();
@@ -3292,6 +3320,29 @@ mod tests {
         fn drop(&mut self) {
             *CONFIG.write().unwrap() = self.original_config.clone();
             *HARD_SETTINGS.write().unwrap() = self.original_hard_settings.clone();
+        }
+    }
+
+    impl ConfigFileRestoreGuard {
+        fn new(path: PathBuf) -> Self {
+            let original_content = fs::read(&path).ok();
+            Self {
+                path,
+                original_content,
+            }
+        }
+    }
+
+    impl Drop for ConfigFileRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(content) = &self.original_content {
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&self.path, content).ok();
+            } else {
+                fs::remove_file(&self.path).ok();
+            }
         }
     }
 
@@ -3482,6 +3533,67 @@ mod tests {
             assert!(updated.salt.is_empty());
             assert_eq!(updated.id, "123456789");
         });
+    }
+
+    #[test]
+    fn test_store_keeps_existing_enc_id_when_id_is_unchanged() {
+        let mut cfg = Config::default();
+        cfg.id = "123456789".to_owned();
+        cfg.enc_id = encrypt_str_or_original(&cfg.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let original_enc_id = cfg.enc_id.clone();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            assert_eq!(Config::load().enc_id, original_enc_id);
+            assert_eq!(Config::get().id, "123456789");
+        });
+    }
+
+    #[test]
+    fn test_store_rewrites_enc_id_when_id_changes() {
+        let original_id = "123456789";
+        let updated_id = "987654321";
+        let mut cfg = Config::default();
+        cfg.id = updated_id.to_owned();
+        let original_enc_id =
+            encrypt_str_or_original(original_id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        cfg.enc_id = original_enc_id.clone();
+
+        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
+            assert!(Config::set(cfg));
+
+            let stored = Config::load().enc_id;
+            let (stored_id, encrypted, _) = decrypt_str_or_original(&stored, PASSWORD_ENC_VERSION);
+            assert_ne!(stored, original_enc_id);
+            assert!(encrypted);
+            assert_eq!(stored_id, updated_id);
+            assert_eq!(Config::get().id, updated_id);
+        });
+    }
+
+    #[test]
+    fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
+        let pin = "123456";
+        let original_unlock_pin =
+            encrypt_str_or_original(pin, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        let mut cfg = Config2 {
+            unlock_pin: original_unlock_pin.clone(),
+            ..Default::default()
+        };
+        Config::store_(&cfg, "2");
+        let (unlock_pin, decrypted, _) =
+            decrypt_str_or_original(&cfg.unlock_pin, PASSWORD_ENC_VERSION);
+        assert!(decrypted);
+        cfg.unlock_pin = unlock_pin;
+        cfg.nat_type = 1;
+
+        cfg.store();
+
+        let stored = Config::load_::<Config2>("2");
+        assert_eq!(stored.unlock_pin, original_unlock_pin);
     }
 
     #[test]
